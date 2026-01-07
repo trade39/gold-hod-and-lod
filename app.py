@@ -17,6 +17,19 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
+def format_hour_ampm(hour_int):
+    """
+    Converts 24-hour integer (0-23) to 12-hour AM/PM string.
+    """
+    if hour_int == 0:
+        return "12:00 AM"
+    elif hour_int == 12:
+        return "12:00 PM"
+    elif hour_int < 12:
+        return f"{hour_int}:00 AM"
+    else:
+        return f"{hour_int - 12}:00 PM"
+
 @st.cache_data(ttl=3600)
 def get_gold_data(period_days):
     """
@@ -155,15 +168,30 @@ if raw_df is not None and not raw_df.empty:
             st.subheader("All Days Combined")
             chart_df_all = calculate_frequencies(stats_df)
             
-            col1, col2 = st.columns(2)
+            # --- Metrics (Updated with AM/PM) ---
+            top_hod_hour_all = chart_df_all['High Probability (%)'].idxmax()
+            top_lod_hour_all = chart_df_all['Low Probability (%)'].idxmax()
             
-            with col1:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Days Analyzed", len(stats_df))
+            col2.metric("Most Frequent HOD", 
+                        f"{format_hour_ampm(top_hod_hour_all)} NY", 
+                        f"{chart_df_all.loc[top_hod_hour_all, 'High Probability (%)']:.1f}%")
+            col3.metric("Most Frequent LOD", 
+                        f"{format_hour_ampm(top_lod_hour_all)} NY", 
+                        f"{chart_df_all.loc[top_lod_hour_all, 'Low Probability (%)']:.1f}%")
+            
+            st.markdown("---")
+            
+            # --- Charts ---
+            colA, colB = st.columns(2)
+            with colA:
                 st.write("**High of Day Probability**")
                 fig_high = px.bar(chart_df_all, x=chart_df_all.index, y='High Probability (%)', 
                                   color='High Probability (%)', color_continuous_scale='Reds')
                 st.plotly_chart(fig_high, use_container_width=True)
 
-            with col2:
+            with colB:
                 st.write("**Low of Day Probability**")
                 fig_low = px.bar(chart_df_all, x=chart_df_all.index, y='Low Probability (%)', 
                                  color='Low Probability (%)', color_continuous_scale='Greens')
@@ -174,9 +202,10 @@ if raw_df is not None and not raw_df.empty:
             st.subheader("Day-Specific Analysis")
             
             # Day Selector
-            selected_day = st.selectbox("Select Day of Week:", 
-                                        ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'], 
-                                        index=['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].index(today_ny) if today_ny in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'] else 0)
+            days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+            default_index = days_list.index(today_ny) if today_ny in days_list else 0
+            
+            selected_day = st.selectbox("Select Day of Week:", days_list, index=default_index)
             
             # Filter Data
             day_stats_df = stats_df[stats_df['Day_Name'] == selected_day]
@@ -192,8 +221,20 @@ if raw_df is not None and not raw_df.empty:
                 top_lod_hour = chart_df_day['Low Probability (%)'].idxmax()
                 
                 m1, m2 = st.columns(2)
-                m1.metric(f"Best Time for High ({selected_day})", f"{top_hod_hour}:00 NY", f"{chart_df_day.loc[top_hod_hour, 'High Probability (%)']:.1f}% prob")
-                m2.metric(f"Best Time for Low ({selected_day})", f"{top_lod_hour}:00 NY", f"{chart_df_day.loc[top_lod_hour, 'Low Probability (%)']:.1f}% prob")
+                
+                # --- UPDATED METRICS WITH AM/PM ---
+                m1.metric(
+                    f"Best Time for High ({selected_day})", 
+                    f"{format_hour_ampm(top_hod_hour)} NY", 
+                    f"{chart_df_day.loc[top_hod_hour, 'High Probability (%)']:.1f}% prob"
+                )
+                m2.metric(
+                    f"Best Time for Low ({selected_day})", 
+                    f"{format_hour_ampm(top_lod_hour)} NY", 
+                    f"{chart_df_day.loc[top_lod_hour, 'Low Probability (%)']:.1f}% prob"
+                )
+
+                st.markdown("---")
 
                 # Charts
                 c1, c2 = st.columns(2)
@@ -211,9 +252,8 @@ if raw_df is not None and not raw_df.empty:
             else:
                 st.warning(f"No data found for {selected_day}. Try increasing history duration.")
 
-        # --- TAB 3: RAW DATA (FIXED) ---
+        # --- TAB 3: RAW DATA ---
         with tab3:
-             # Removed .style.format() to prevent error on text columns
              st.dataframe(stats_df, use_container_width=True)
 
     else:
