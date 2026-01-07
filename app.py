@@ -16,48 +16,64 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600)  # Cache data for 1 hour to prevent API spam
+@st.cache_data(ttl=3600)
 def get_gold_data(period_days):
     """
-    Fetches hourly data for Gold Futures (GC=F) from Yahoo Finance.
-    Limit for hourly data in yfinance is typically around 730 days.
+    Fetches hourly data. Tries Spot Gold (XAUUSD=X) first, then Futures (GC=F).
     """
-    # GC=F is Gold Futures. You could also use 'XAUUSD=X' for Spot Gold.
-    ticker = "GC=F"
-    
-    # Calculate period string (e.g., "730d")
     period_str = f"{period_days}d"
     
-    # Fetch data
-    df = yf.download(ticker, interval="1h", period=period_str, progress=False)
+    # List of tickers to try
+    tickers = ["XAUUSD=X", "GC=F"]
     
-    # Handle MultiIndex columns if present (common in newer yfinance versions)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
-    # Reset index to make Datetime a column for easier processing
-    df = df.reset_index()
-    
-    # Ensure standard column names
-    df.columns = [c.capitalize() for c in df.columns]
-    
-    return df
+    for ticker in tickers:
+        try:
+            # Fetch data
+            df = yf.download(ticker, interval="1h", period=period_str, progress=False)
+            
+            # Check if dataframe is empty
+            if df.empty:
+                continue
+            
+            # ---------------------------------------------------------
+            # DATA CLEANING (Crucial for new yfinance versions)
+            # ---------------------------------------------------------
+            # Flatten MultiIndex columns if they exist (e.g., ('Close', 'GC=F') -> 'Close')
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # Reset index to make Datetime a column
+            df = df.reset_index()
+            
+            # Ensure standard column names
+            df.columns = [c.capitalize() for c in df.columns]
+            
+            # Check if we successfully got a valid dataframe with required columns
+            if 'High' in df.columns and 'Low' in df.columns:
+                return df, ticker
+
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}")
+            continue
+            
+    return pd.DataFrame(), None
 
 def process_data(df):
     """
     Converts timestamps to NY time and identifies the hour of HOD/LOD.
     """
+    if df is None or df.empty:
+        return None
+
     # Rename 'Datetime' or 'Date' to 'timestamp'
     if 'Datetime' in df.columns:
         df = df.rename(columns={'Datetime': 'timestamp'})
     elif 'Date' in df.columns:
         df = df.rename(columns={'Date': 'timestamp'})
     else:
-        st.error("Could not find datetime column in data.")
         return None
 
     # 1. Convert Timezone to America/New_York
-    # Yahoo Finance usually returns UTC. We assume UTC if tz-naive.
     if df['timestamp'].dt.tz is None:
         df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
     
@@ -68,13 +84,12 @@ def process_data(df):
     df['Hour_NY'] = df['timestamp'].dt.hour
 
     # 3. Identify High of Day (HOD) and Low of Day (LOD) Hour
-    # Group by NY Date
     grouped = df.groupby('Date_NY')
 
     stats_list = []
 
     for date, group in grouped:
-        # Skip incomplete days (e.g. strict checking can be added here)
+        # Skip incomplete days (less than 5 hours of data)
         if len(group) < 5: 
             continue
 
@@ -100,19 +115,21 @@ def process_data(df):
 st.title("🏆 Gold Hourly Volatility Analyzer")
 st.markdown("""
 **Objective:** Detect statistically which hour of the day produces the **High** and **Low** of the day.
-*Timezone:* **New York (EST/EDT)** | *Asset:* **Gold Futures (GC=F)**
+*Timezone:* **New York (EST/EDT)**
 """)
 
 # Sidebar Controls
 st.sidebar.header("Settings")
-days_history = st.sidebar.slider("Days of History", min_value=30, max_value=720, value=365, step=30)
-st.sidebar.info("Note: Hourly data is limited to the last ~730 days by the data provider.")
+days_history = st.sidebar.slider("Days of History", min_value=30, max_value=720, value=60, step=30)
+st.sidebar.caption("Data provided by Yahoo Finance (yfinance).")
 
 # Load Data
 with st.spinner("Fetching market data..."):
-    raw_df = get_gold_data(days_history)
+    raw_df, active_ticker = get_gold_data(days_history)
 
 if raw_df is not None and not raw_df.empty:
+    st.sidebar.success(f"Loaded data for: {active_ticker}")
+    
     # Process Data
     stats_df = process_data(raw_df)
     
@@ -138,7 +155,7 @@ if raw_df is not None and not raw_df.empty:
 
         chart_df['High Probability (%)'] = hod_pct
         chart_df['Low Probability (%)'] = lod_pct
-        chart_df = chart_df.fillna(0) # Fill hours with 0 occurrences
+        chart_df = chart_df.fillna(0) 
 
         # ---------------------------------------------------------------------
         # VISUALIZATION
@@ -186,12 +203,18 @@ if raw_df is not None and not raw_df.empty:
             st.plotly_chart(fig_low, use_container_width=True)
 
         # ---------------------------------------------------------------------
-        # HEATMAP VIEW (Optional advanced view)
+        # HEATMAP VIEW (Safe version without Matplotlib dependency)
         # ---------------------------------------------------------------------
         with st.expander("View Raw Frequency Data"):
-            st.dataframe(chart_df.style.format("{:.1f}%").background_gradient(cmap="Blues"))
+             st.dataframe(chart_df.style.format("{:.1f}%"))
 
     else:
-        st.warning("Not enough data to calculate statistics.")
+        st.warning("Data downloaded but processing failed. Please try a different date range.")
 else:
-    st.error("Failed to download data. Please try again later or reduce the history range.")
+    st.error("❌ Failed to download data.")
+    st.markdown("""
+    **Troubleshooting:**
+    1. Yahoo Finance may be temporarily blocking requests.
+    2. Try reducing the "Days of History" slider to 30 or 60 days.
+    3. Refresh the page in a few minutes.
+    """)
