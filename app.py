@@ -211,9 +211,10 @@ if raw_df is not None and not raw_df.empty:
             else:
                 st.warning(f"No data found for {selected_day}. Try increasing history duration.")
 
-        # --- TAB 3: RAW DATA ---
+        # --- TAB 3: RAW DATA (FIXED) ---
         with tab3:
-             st.dataframe(stats_df.style.format("{:.1f}"), use_container_width=True)
+             # Removed .style.format() to prevent error on text columns
+             st.dataframe(stats_df, use_container_width=True)
 
     else:
         st.warning("Data downloaded but processing failed.")
