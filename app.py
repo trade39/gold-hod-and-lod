@@ -31,36 +31,71 @@ def format_hour_ampm(hour_int):
 @st.cache_data(ttl=3600)
 def get_market_data(ticker, period_days):
     """
-    Fetches hourly data for selected asset.
+    Robust data fetching with strict column cleaning.
     """
     period_str = f"{period_days}d"
     try:
+        # Fetch data
         df = yf.download(ticker, interval="1h", period=period_str, progress=False)
-        if df.empty: return pd.DataFrame()
         
-        # Flatten MultiIndex if exists
+        if df.empty:
+            return pd.DataFrame()
+
+        # -------------------------------------------------------
+        # CRITICAL FIX: Handle MultiIndex Columns (Price, Ticker)
+        # -------------------------------------------------------
+        # yfinance often returns columns like: ('Close', 'GC=F')
         if isinstance(df.columns, pd.MultiIndex):
+            # We want the level that contains 'Close', 'High', etc.
+            # Usually that is level 0.
             df.columns = df.columns.get_level_values(0)
         
+        # Reset index to make 'Datetime' a column
         df = df.reset_index()
-        # Clean column names
-        df.columns = [c.capitalize() for c in df.columns]
+
+        # Rename the date column to 'timestamp' standard
+        # yfinance might call it 'Date' or 'Datetime'
+        col_map = {c: c.capitalize() for c in df.columns} # Capitalize everything first
+        df = df.rename(columns=col_map)
         
-        # Standardize date column
-        if 'Datetime' in df.columns: df = df.rename(columns={'Datetime': 'timestamp'})
-        elif 'Date' in df.columns: df = df.rename(columns={'Date': 'timestamp'})
+        if 'Datetime' in df.columns:
+            df = df.rename(columns={'Datetime': 'timestamp'})
+        elif 'Date' in df.columns:
+            df = df.rename(columns={'Date': 'timestamp'})
+            
+        # Ensure we have the required columns
+        required = ['Timestamp', 'High', 'Low', 'Open', 'Close']
+        # Note: We capitalized columns above, so we check for capitalized names
+        # 'timestamp' is lowercase in our logic, so let's fix that:
+        df = df.rename(columns={'Timestamp': 'timestamp'}) 
         
+        if 'timestamp' not in df.columns:
+            # Last ditch effort to find the date column
+            for col in df.columns:
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df = df.rename(columns={col: 'timestamp'})
+                    break
+
         return df
     except Exception as e:
-        print(f"Error: {e}")
+        st.error(f"Data Download Error: {e}")
         return pd.DataFrame()
 
 def process_data(df):
-    if df is None or df.empty: return None
+    if df is None or df.empty: return None, None
+
+    # Check for required columns again
+    req_cols = ['timestamp', 'High', 'Low']
+    for c in req_cols:
+        if c not in df.columns:
+            st.error(f"Missing column: {c}. Available: {df.columns.tolist()}")
+            return None, None
 
     # Timezone Conversion (UTC -> NY)
     if df['timestamp'].dt.tz is None:
         df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
+    
+    # Convert to NY time
     df['timestamp'] = df['timestamp'].dt.tz_convert('America/New_York')
 
     # Derived Columns
@@ -68,7 +103,7 @@ def process_data(df):
     df['Hour_NY'] = df['timestamp'].dt.hour
     df['Day_Name'] = df['timestamp'].dt.strftime('%A')
     
-    # Calculate Range (High - Low)
+    # Calculate Range
     df['Range'] = df['High'] - df['Low']
 
     # --- AGGREGATION PER DAY ---
@@ -100,36 +135,29 @@ def process_data(df):
             'Close_Price': group.iloc[-1]['Close']
         })
 
-    return pd.DataFrame(stats_list), df # Return stats AND hourly data
+    return pd.DataFrame(stats_list), df
 
 # -----------------------------------------------------------------------------
 # MACHINE LEARNING ENGINE
 # -----------------------------------------------------------------------------
 def train_hod_lod_model(stats_df):
-    """
-    Simple Random Forest to classify if a specific hour holds the HOD/LOD.
-    Target: Does HOD happen in NY AM Session (7-11)? 1=Yes, 0=No.
-    """
-    # Feature Engineering
+    if stats_df is None or len(stats_df) < 10:
+        return None, 0
+
     ml_df = stats_df.copy()
-    
-    # Target: Did the HOD occur between 9 AM and 11 AM (Classic ICT Silver Bullet/Open)?
     ml_df['Target_AM_High'] = ml_df['HOD_Hour'].apply(lambda x: 1 if 9 <= x <= 11 else 0)
-    
-    # Features: Day of week (encoded), Previous Day Range (shifted)
     ml_df['Day_Code'] = pd.Categorical(ml_df['Day_Name']).codes
     ml_df['Prev_Range'] = ml_df['Daily_Range'].shift(1)
-    
     ml_df = ml_df.dropna()
     
-    if len(ml_df) < 50: return None, 0 # Not enough data
+    if len(ml_df) < 20: return None, 0
 
     X = ml_df[['Day_Code', 'Prev_Range']]
     y = ml_df['Target_AM_High']
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    model = RandomForestClassifier(n_estimators=100, max_depth=5)
+    model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
     model.fit(X_train, y_train)
     
     acc = accuracy_score(y_test, model.predict(X_test))
@@ -155,14 +183,22 @@ selected_ticker = asset_map[selected_asset_name]
 days_history = st.sidebar.slider("Days of History", 30, 720, 180, 30)
 
 # Fetch Data
+stats_df = None
+hourly_df = None
+
 with st.spinner(f"Analyzing {selected_asset_name} market structure..."):
-    stats_df, hourly_df = None, None
     raw_df = get_market_data(selected_ticker, days_history)
     
     if not raw_df.empty:
         stats_df, hourly_df = process_data(raw_df)
+    else:
+        # Fallback debug message
+        st.error("⚠️ Data download returned empty.")
+        with st.expander("Debug Info"):
+            st.write(f"Ticker: {selected_ticker}")
+            st.write("Troubleshooting: Try reducing 'Days of History' or switching Assets.")
 
-if stats_df is not None:
+if stats_df is not None and not stats_df.empty:
     # -------------------------------------------------------------------------
     # DASHBOARD HEADER
     # -------------------------------------------------------------------------
@@ -194,7 +230,7 @@ if stats_df is not None:
         "🛠️ Tools & Export"
     ])
 
-    # === TAB 1: DAILY FORECAST (Visual Polish) ===
+    # === TAB 1: DAILY FORECAST ===
     with tab_forecast:
         st.subheader(f"Session Profile: {today_name}")
         
@@ -218,8 +254,7 @@ if stats_df is not None:
             fig.add_trace(go.Bar(x=chart_data.index, y=chart_data['High Prob %'], name='High Probability', marker_color='#ff4b4b'))
             fig.add_trace(go.Bar(x=chart_data.index, y=chart_data['Low Prob %'], name='Low Probability', marker_color='#2bd27f'))
 
-            # Add ICT Kill Zones (Vertical Rectangles)
-            # London Open (2-5 AM), NY AM (7-11 AM), NY PM (13-16 PM)
+            # Add ICT Kill Zones
             kill_zones = [
                 (2, 5, "London Open", "rgba(0, 0, 255, 0.1)"),
                 (7, 10, "NY Open", "rgba(255, 165, 0, 0.1)"),
@@ -251,16 +286,15 @@ if stats_df is not None:
         else:
             st.warning("Not enough data for this specific day.")
 
-    # === TAB 2: DEEP ANALYTICS (Volatility & Ranges) ===
+    # === TAB 2: DEEP ANALYTICS ===
     with tab_analytics:
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("Volatility Heatmap (Avg Range)")
-            # Calculate Avg Range per Day of Week
-            vol_stats = stats_df.groupby('Day_Name')['Daily_Range'].mean().reindex(
-                ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-            )
+            # Reorder days
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+            vol_stats = stats_df.groupby('Day_Name')['Daily_Range'].mean().reindex(day_order)
             
             fig_vol = px.bar(
                 x=vol_stats.index, y=vol_stats.values,
@@ -285,11 +319,11 @@ if stats_df is not None:
             )
             st.plotly_chart(fig_pie, use_container_width=True)
 
-    # === TAB 3: AI INSIGHTS (Machine Learning) ===
+    # === TAB 3: AI INSIGHTS ===
     with tab_ml:
         st.subheader("🤖 Pattern Recognition Engine (Beta)")
         st.markdown("""
-        We trained a **Random Forest Classifier** on your historical data to predict market behavior.
+        We trained a **Random Forest Classifier** on your historical data.
         *Question:* "Will the High of the Day form in the NY AM Session (9am - 11am)?"
         """)
         
@@ -300,18 +334,18 @@ if stats_df is not None:
                 st.success(f"Model Trained Successfully! Accuracy: **{accuracy:.1%}**")
                 
                 # Prediction for tomorrow
-                last_range = stats_df.iloc[-1]['Daily_Range']
-                day_code = (datetime.now().weekday() + 1) % 7 # Next day code (rough approx)
-                
-                # Simple prediction logic
-                prediction = model.predict([[day_code, last_range]])[0]
-                prob = model.predict_proba([[day_code, last_range]])[0]
-                
-                st.markdown("### 🔮 Tomorrow's Prediction")
-                if prediction == 1:
-                    st.success(f"**High Probability of AM High:** The AI predicts a **{prob[1]:.1f}%** chance the HOD will form between 9-11 AM tomorrow.")
-                else:
-                    st.warning(f"**Low Probability of AM High:** The AI predicts the High will likely form outside the NY AM session ({prob[0]:.1f}% chance).")
+                if not stats_df.empty:
+                    last_range = stats_df.iloc[-1]['Daily_Range']
+                    day_code = (datetime.now().weekday() + 1) % 7 
+                    
+                    prediction = model.predict([[day_code, last_range]])[0]
+                    prob = model.predict_proba([[day_code, last_range]])[0]
+                    
+                    st.markdown("### 🔮 Tomorrow's Prediction")
+                    if prediction == 1:
+                        st.success(f"**High Probability of AM High:** The AI predicts a **{prob[1]:.1f}%** chance the HOD will form between 9-11 AM tomorrow.")
+                    else:
+                        st.warning(f"**Low Probability of AM High:** The AI predicts the High will likely form outside the NY AM session ({prob[0]:.1f}% chance).")
             else:
                 st.error("Not enough data to train model yet.")
         else:
@@ -320,32 +354,30 @@ if stats_df is not None:
     # === TAB 4: TOOLS & EXPORT ===
     with tab_tools:
         st.subheader("💻 Pine Script Generator")
-        st.markdown("Copy this code into TradingView to plot these stats on your chart.")
+        st.markdown("Copy this code into TradingView.")
         
-        # Determine best hours
         best_h_hour = stats_df['HOD_Hour'].mode()[0]
         best_l_hour = stats_df['LOD_Hour'].mode()[0]
         
         pine_script = f"""
-        // This script was generated by your Streamlit App
+        // Generated by Streamlit App
         //@version=5
         indicator("Statistical High/Low Time", overlay=true)
         
-        // Settings
+        // Best Hours
         highTime = {best_h_hour}
         lowTime = {best_l_hour}
         
-        // Logic
+        // Highlights
         isHighTime = hour == highTime
         isLowTime = hour == lowTime
         
-        bgcolor(isHighTime ? color.new(color.red, 90) : na, title="High Prob Zone")
-        bgcolor(isLowTime ? color.new(color.green, 90) : na, title="Low Prob Zone")
+        bgcolor(isHighTime ? color.new(color.red, 80) : na, title="High Prob Zone")
+        bgcolor(isLowTime ? color.new(color.green, 80) : na, title="Low Prob Zone")
         """
         st.code(pine_script, language="pine")
         
         st.divider()
-        st.subheader("Raw Data Export")
         st.download_button(
             label="Download CSV",
             data=stats_df.to_csv(index=False).encode('utf-8'),
@@ -354,4 +386,11 @@ if stats_df is not None:
         )
 
 else:
-    st.error("No data available. Please check the sidebar settings or try again later.")
+    # If we are here, stats_df is None or empty even after the fallback check in spinner
+    st.warning("⚠️ No data available to display.")
+    st.markdown("""
+    **Possible reasons:**
+    1. The market is currently closed or the API is rate-limiting requests.
+    2. The 'Days of History' is too short to find valid days.
+    3. Try switching the Asset to 'S&P 500' to test if the connection works.
+    """)
